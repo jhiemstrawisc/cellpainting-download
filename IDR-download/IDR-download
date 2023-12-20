@@ -1,0 +1,201 @@
+#!/usr/bin/python3
+
+import argparse
+import csv
+import os
+import pathlib
+import subprocess
+import sys
+import zipfile
+
+import classad
+import htcondor
+import htcondor.dags
+
+
+class ExistingWorkingDir(Exception):
+    pass
+
+
+def generateDAG(job_prefix, working_dir, max_running, max_plates, destination_dir, plates_file):
+    '''
+    Input file is a CSV containing columns |study|path-suffix|plate|
+    where 
+    - study is the name of the IDR study (eg idr0003)
+    - path-suffix is the path for a particular plate relative toftp.ebi.ac.uk/pub/databases/IDR (eg idr0003-breker-plasticity/201301120/Images/DTT/p13)
+    - plate is the name of the plate, used mostly for book-keeping and naming (eg plate_5A)
+
+    '''
+
+    # Construct plates as a list of tuples containing (study, path, plate)
+    plates = []
+    with open(plates_file, 'r', newline='') as csv_file:
+        csv_reader = csv.reader(csv_file)
+        for row in csv_reader:
+            plates.append(tuple(row))
+            if max_plates and len(plates) >= max_plates:
+                break
+
+    # Script path is the absolute path to this python script
+    script_path = str(pathlib.Path(sys.argv[0]).absolute())
+
+    # We're using wget to handle recursive downloads from the IDR database. We get the path to wget
+    #wget_path = str(( pathlib.Path(sys.argv[0]).parent / "wget" ).absolute())
+
+    # Create the actual DAG specification.
+    downloader_submit_description = htcondor.Submit({
+        "executable":              script_path,
+        "arguments":              f"exec $(STUDY) $(PATH) $(PLATE) {destination_dir}",
+        "universe":                "vanilla",
+        "request_disk":            "100GB",
+        "request_cpus":             4,
+        "request_memory":           512,
+        "log":                    f"{job_prefix}-$(CLUSTER).log",
+        "should_transfer_files":   "YES",
+        "when_to_transfer_output": "ON_EXIT",
+        # Hack to target only the tech refresh hosts (which have significantly more network capacity)
+        "requirements":            'CpuModel =?= "AMD EPYC 7763 64-Core Processor"',
+        #"transfer_input_files":    wget_path,
+        #"transfer_output_files":   "config/config.json",
+        "output":                  "download-$(JOB)_$(RETRY).out",
+        "error":                   "download-$(JOB)_$(RETRY).err",
+    })
+    working_dir_path = pathlib.Path(working_dir)
+
+    # Use the previous DAG submission description to actually set up the DAG
+    # dag = htcondor.dags.DAG(dagman_config={"DAGMAN_USE_DIRECT_SUBMIT" : False})
+    dag = htcondor.dags.DAG()
+    dag.layer(
+       name = job_prefix,
+       submit_description = downloader_submit_description,
+       vars = [{"node_name": f"plate-{idx}", "STUDY": plates[idx][0], "PATH": plates[idx][1], "PLATE": plates[idx][2]} for idx in range(len(plates))],
+       retries = int(3),
+    )
+
+    dag_dir = pathlib.Path(working_dir).absolute()
+    try:
+        dag_dir.mkdir()
+    except FileExistsError:
+        dir_str = str(dag_dir)
+        raise ExistingWorkingDir(f"Working directory, {dir_str}, already exists; remove to reuse")
+
+    dag_file = htcondor.dags.write_dag(dag, dag_dir, node_name_formatter=htcondor.dags.SimpleFormatter("_"))
+
+    dag_submit = htcondor.Submit.from_dag(str(dag_file),{
+        'batch-name': job_prefix,
+        'maxjobs': max_running
+    })
+
+    os.chdir(dag_dir)
+    schedd = htcondor.Schedd()
+    submit_result = schedd.submit(dag_submit)
+    print("Download jobs were submitted as DAG with JobID %d.0" % submit_result.cluster())
+
+
+def countDags(job_prefix):
+    schedd = htcondor.Schedd()
+    return len(list(schedd.query(constraint='JobBatchName =?= %s' % classad.quote(job_prefix), projection=[])))
+
+
+def helperMain():
+    '''
+    Run on the EP, helperMain() is responsible for:
+    - Downloading the study/plate combo from the IDR FTP server to a local directory called $(plate_path)
+    - Creating a list of the files with their relative IDR path (eg /idr0003-breker-plasticity/201301120/Images/DTT/p13/$FILENAME)
+    - Creating a directory at $DESTINATION/$STUDY and moving the previous two to this location
+    '''
+    parser = argparse.ArgumentParser(description="Run a script for the IDR download application")
+    parser.add_argument("command", help="Helper command to run", choices=["exec"])
+    parser.add_argument("study", help="Name of the IDR study being downloaded")
+    parser.add_argument("plate_path", help="Path of the plate relative to the root FTP server")
+    parser.add_argument("plate", help="Name of the plate collection to download")
+    parser.add_argument("destination", help="Mounted destination path for resulting directory, containing zipfile and file listing")
+    
+    args = parser.parse_args()
+    plate = args.plate.replace("/", "_")
+
+    # FTP server for the IDR datasets
+    ftp_server = "ftp://ftp.ebi.ac.uk/pub/databases/IDR/"
+
+    # Handle early stopping. If the zip file that will ultimately be created already exists at the destination,
+    # we assume there's nothing left to do.
+    outputs_prefix = args.study.replace("/", "_") + "-" + plate
+    zipname = outputs_prefix + ".zip"
+    filelist_csv_name = outputs_prefix + ".csv"
+    output_dir = os.path.join(args.destination, args.study)
+    output_zip = os.path.join(output_dir, zipname)
+    output_filelist_csv = os.path.join(output_dir, filelist_csv_name)
+    if os.path.exists(output_zip):
+        return 0
+
+    # COMMAND:
+    os.makedirs(plate, exist_ok=True)
+    command = f"curl -s -l {ftp_server}{args.plate_path}/ | xargs -n 1 -P `nproc` -I {{}} curl -s -C - -o `pwd`/{plate}/{{}} {ftp_server}{args.plate_path}/{{}}"
+    print("Executing command:\n", command)
+    # Run wget to actually download the directory to a local dir called $(plate_path)
+    # subprocess.run(["wget", "--recursive", "--no-parent", "--no-directories", "--no-clobber", "--execute", "robots=off", "--directory-prefix="+args.plate, ftp_server+args.plate_path], env={"PATH": "/usr/bin"}, check=True)
+
+    try:
+        os.environ.unsetenv("FTP_PROXY")
+        subprocess.run(command, shell=True, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"An error occurred: {e}")
+        return 1
+
+    files = []
+    with zipfile.ZipFile(zipname, mode='w') as zf:
+        for dirpath, dirnames, filenames in os.walk(plate):
+            for filename in filenames:
+                full_filename = os.path.join(dirpath, filename)
+                zf.write(full_filename)
+                os.unlink(full_filename)
+                # Keep track of filenames for creating the csv. Append to files as a list
+                # so that our CSV writer interprets the entire string as a column (otherwise
+                # we get each character as a column)
+                files.append([os.path.join(args.plate_path, filename)])
+
+    with open(filelist_csv_name, "w", newline='') as csv_file:
+        csv_writer = csv.writer(csv_file)
+        csv_writer.writerows(files)
+
+    os.makedirs(output_dir, exist_ok=True)
+    # subprocess.run(["/usr/bin/mkdir", "-p", output_dir])
+    subprocess.run(["/usr/bin/mv", zipname, output_zip], check=True)
+    subprocess.run(["/usr/bin/mv", filelist_csv_name, output_filelist_csv], check=True)
+
+
+def topMain():
+    parser = argparse.ArgumentParser(description="Execute a download of a IDR dataset")
+    parser.add_argument("command", help="Sub-command to run", choices=["submit", "resubmit", "list"])
+    parser.add_argument("--instance", help="Instance name for the run", default="IDR-download")
+    parser.add_argument("-w", "--working-dir", help="Working directory for the DAG associated with the download instance", default="working_dir")
+    parser.add_argument("-p", "--plates", help="File containing list of all the plates to download", default="plates.txt")
+    parser.add_argument("-d", "--destination", help="Destination directory for output zipfiles", required=True)
+    parser.add_argument("-r", "--max-running", help="Maximum number of running download jobs", default=5)
+    parser.add_argument("--max-plates", help="Maximum number of plates to download", type=int)
+
+    args = parser.parse_args()
+
+    if countDags(args.instance):
+        print(f"Cannot submit new download named {args.instance}; one already exists in queue")
+        return 2
+
+    if args.command != "submit":
+        print(f"Command {args.command} is not implemented")
+        return 3
+
+    generateDAG(args.instance, args.working_dir, args.max_running, args.max_plates, args.destination, args.plates)
+    return 0
+
+
+def main():
+    # The same script serves as both the driver and the EP-side wrapper. Look
+    # at argv[1] to see what we should do in order to avoid dumping confusing help
+    # options to the user
+    if len(sys.argv) > 1 and sys.argv[1] in ["exec"]:
+        return helperMain()
+
+    return topMain()
+
+if __name__ == '__main__':
+    sys.exit(main())
