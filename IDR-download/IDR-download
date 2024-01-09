@@ -129,15 +129,15 @@ def helperMain():
         return 0
 
     # COMMAND:
-    os.makedirs(plate, exist_ok=True)
-    command = f"curl -s -l {ftp_server}{args.plate_path}/ | xargs -n 1 -P `nproc` -I {{}} curl -s -C - -o `pwd`/{plate}/{{}} {ftp_server}{args.plate_path}/{{}}"
-    print("Executing command:\n", command)
-    # Run wget to actually download the directory to a local dir called $(plate_path)
-    # subprocess.run(["wget", "--recursive", "--no-parent", "--no-directories", "--no-clobber", "--execute", "robots=off", "--directory-prefix="+args.plate, ftp_server+args.plate_path], env={"PATH": "/usr/bin"}, check=True)
-
+    #os.makedirs(plate, exist_ok=True)
+    # command = f"curl -l {ftp_server}{args.plate_path}/ | xargs -n 1 -P `nproc` -I {{}} curl -C - -o `pwd`/{plate}/{{}} {ftp_server}{args.plate_path}/{{}}"
+    #print("Executing command:\n", command)
+   
     try:
         os.environ.unsetenv("FTP_PROXY")
-        subprocess.run(command, shell=True, check=True)
+        # Run wget to actually download the directory to a local dir called $(plate_path)
+        subprocess.run(["wget", "--recursive", "--no-parent", "--no-directories", "--no-clobber", "--execute", "robots=off", "--directory-prefix="+args.plate, ftp_server+args.plate_path], env={"PATH": "/usr/bin"}, check=True)
+        #subprocess.run(command, shell=True, check=True)
     except subprocess.CalledProcessError as e:
         print(f"An error occurred: {e}")
         return 1
