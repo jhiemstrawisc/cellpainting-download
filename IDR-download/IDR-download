@@ -7,6 +7,7 @@ import pathlib
 import subprocess
 import sys
 import zipfile
+from urllib.parse import quote, urljoin
 
 import classad
 import htcondor
@@ -54,7 +55,7 @@ def generateDAG(job_prefix, working_dir, max_running, max_plates, destination_di
         "should_transfer_files":   "YES",
         "when_to_transfer_output": "ON_EXIT",
         # Hack to target only the tech refresh hosts (which have significantly more network capacity)
-        "requirements":            'CpuModel =?= "AMD EPYC 7763 64-Core Processor"',
+        "requirements":            '(CpuModel =?= "AMD EPYC 7763 64-Core Processor") && ((TARGET.HasMorgridgeHdd ?: false) == true)',
         #"transfer_input_files":    wget_path,
         #"transfer_output_files":   "config/config.json",
         "output":                  "download-$(JOB)_$(RETRY).out",
@@ -68,7 +69,7 @@ def generateDAG(job_prefix, working_dir, max_running, max_plates, destination_di
     dag.layer(
        name = job_prefix,
        submit_description = downloader_submit_description,
-       vars = [{"node_name": f"plate-{idx}", "STUDY": plates[idx][0], "PATH": plates[idx][1], "PLATE": plates[idx][2]} for idx in range(len(plates))],
+       vars = [{"node_name": f"plate-{idx}", "STUDY": plates[idx][0], "PATH": quote(plates[idx][1]), "PLATE": plates[idx][2]} for idx in range(len(plates))],
        retries = int(3),
     )
 
@@ -128,6 +129,9 @@ def helperMain():
     if os.path.exists(output_zip):
         return 0
 
+    # Some plate files have paths that produce invalid URLs in the call to curl/wget. Parse those here
+    combined_url = urljoin(ftp_server, quote(args.plate_path))
+
     # COMMAND:
     #os.makedirs(plate, exist_ok=True)
     # command = f"curl -l {ftp_server}{args.plate_path}/ | xargs -n 1 -P `nproc` -I {{}} curl -C - -o `pwd`/{plate}/{{}} {ftp_server}{args.plate_path}/{{}}"
@@ -136,7 +140,7 @@ def helperMain():
     try:
         os.environ.unsetenv("FTP_PROXY")
         # Run wget to actually download the directory to a local dir called $(plate_path)
-        subprocess.run(["wget", "--recursive", "--no-parent", "--no-directories", "--no-clobber", "--execute", "robots=off", "--directory-prefix="+args.plate, ftp_server+args.plate_path], env={"PATH": "/usr/bin"}, check=True)
+        subprocess.run(["wget", "--recursive", "--no-parent", "--no-directories", "--no-clobber", "--execute", "robots=off", "--directory-prefix="+args.plate, combined_url], env={"PATH": "/usr/bin"}, check=True)
         #subprocess.run(command, shell=True, check=True)
     except subprocess.CalledProcessError as e:
         print(f"An error occurred: {e}")
