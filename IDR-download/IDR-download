@@ -181,7 +181,7 @@ def topMain():
     args = parser.parse_args()
 
     if countDags(args.instance):
-        print(f"Cannot submit new download named {args.instance}; one already exists in queue")
+        print(f"Cannot submit new download named {args.instance}; one already exists in queue. To create a new instance, use the --instance option and provide a new name.")
         return 2
 
     if args.command != "submit":
